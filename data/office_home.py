@@ -52,28 +52,38 @@ class OfficeHomeTarget(Dataset):
 
         full_dataset = load_dataset("flwrlabs/office-home", split="train")
 
-        # 手动分组：一次遍历，按域分类
-        self.target_datasets = {}
-        for item in full_dataset:
-            domain = item["domain"]
-            if domain != source_domain:  # 排除源域
-                if domain not in self.target_datasets:
-                    self.target_datasets[domain] = []
-                self.target_datasets[domain].append(item)
+        all_domains = full_dataset.unique("domain")
+        self.target_domains = [d for d in all_domains if d != source_domain]
 
-        self.target_domains = list(self.target_datasets.keys())  # 自动得到三个域名
-        self.length = max(len(items) for items in self.target_datasets.values())
+        print("Processing target domains:", self.target_domains)
+
+        # 高效筛选：遍历一次获取所有需要的索引，避免多次全量 filter
+        domain_indices = {d: [] for d in self.target_domains}
+
+        for idx, domain in enumerate(full_dataset["domain"]):
+            if domain in domain_indices:
+                domain_indices[domain].append(idx)
+
+        self.target_datasets = {
+            domain: full_dataset.select(indices)
+            for domain, indices in domain_indices.items()
+        }
+
+        self.length = max(len(ds) for ds in self.target_datasets.values()) * len(
+            self.target_domains
+        )
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
         # 域均衡策略：轮流从三个域采样
-        domain = self.target_domains[idx % len(self.target_domains)]
+        num_domains = len(self.target_domains)
+        domain_idx = idx % num_domains
+        domain = self.target_domains[domain_idx]
         dataset = self.target_datasets[domain]
 
-        # 如果 idx 超出该域长度，循环采样
-        sample_idx = idx % len(dataset)
+        sample_idx = (idx // num_domains) % len(dataset)
         item = dataset[sample_idx]
 
         image = item["image"]
