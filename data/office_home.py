@@ -1,4 +1,4 @@
-from transformers import AutoProcessor
+from transformers import AutoImageProcessor
 from datasets import load_dataset
 from torch.utils.data import Dataset
 import random
@@ -12,7 +12,7 @@ class OfficeHomeSource(Dataset):
 
     def __init__(self, domain, model_name):
         self.domain = domain
-        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.image_processor = AutoImageProcessor.from_pretrained(model_name)
 
         self.dataset = load_dataset("flwrlabs/office-home", split="train").filter(
             lambda example: example["domain"] == domain
@@ -34,7 +34,7 @@ class OfficeHomeSource(Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        pixel_values = self.processor(image, return_tensors="pt").pixel_values.squeeze(
+        pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(
             0
         )  # (,3,224,224)
 
@@ -48,7 +48,7 @@ class OfficeHomeTarget(Dataset):
     """目标域数据集（无标签，域均衡采样）"""
 
     def __init__(self, source_domain, model_name):
-        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.image_processor = AutoImageProcessor.from_pretrained(model_name)
 
         full_dataset = load_dataset("flwrlabs/office-home", split="train")
 
@@ -58,15 +58,9 @@ class OfficeHomeTarget(Dataset):
         print("Processing target domains:", self.target_domains)
 
         # 高效筛选：遍历一次获取所有需要的索引，避免多次全量 filter
-        domain_indices = {d: [] for d in self.target_domains}
-
-        for idx, domain in enumerate(full_dataset["domain"]):
-            if domain in domain_indices:
-                domain_indices[domain].append(idx)
-
         self.target_datasets = {
-            domain: full_dataset.select(indices)
-            for domain, indices in domain_indices.items()
+            domain: full_dataset.filter(lambda x: x["domain"] == domain)
+            for domain in self.target_domains
         }
 
         self.length = max(len(ds) for ds in self.target_datasets.values()) * len(
@@ -90,7 +84,7 @@ class OfficeHomeTarget(Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        pixel_values = self.processor(image, return_tensors="pt").pixel_values.squeeze(
+        pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(
             0
         )
 
@@ -101,7 +95,7 @@ class OfficeHomeEval(Dataset):
     """评估数据集（单个目标域）"""
 
     def __init__(self, target_domain, model_name):
-        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.image_processor = AutoImageProcessor.from_pretrained(model_name)
 
         self.dataset = load_dataset("flwrlabs/office-home", split="train").filter(
             lambda example: example["domain"] == target_domain
@@ -120,7 +114,7 @@ class OfficeHomeEval(Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        pixel_values = self.processor(image, return_tensors="pt").pixel_values.squeeze(
+        pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(
             0
         )
 

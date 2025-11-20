@@ -7,8 +7,8 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.modeling_outputs import BaseModelOutput
 from torch.nn import functional as F
-from modules.grl import grad_reverse
-from modules.output import GSPAOutput
+from .modules.grl import grad_reverse
+from .modules.output import GSPAOutput
 
 # 加载 CLIP
 model_name = "openai/clip-vit-base-patch16"
@@ -48,7 +48,9 @@ class ConditionalPromptLearner(nn.Module):
         self.token_embedding = (
             self.clip.text_model.embeddings.token_embedding
         )  # token embedding
-        self.embedding = self.clip.text_model.embeddings
+        # 不保存 embedding 的引用，避免与 token_embedding 重复
+        # self.embedding = self.clip.text_model.embeddings  # 移除此行
+        self.position_embedding = self.clip.text_model.embeddings.position_embedding
         self.text_encoder = self.clip.text_model.encoder
         self.final_layer_norm = self.clip.text_model.final_layer_norm
 
@@ -56,7 +58,7 @@ class ConditionalPromptLearner(nn.Module):
         self.vision_embedding = self.clip.vision_model.embeddings
         self.vision_pre_layernorm = self.clip.vision_model.pre_layrnorm
         self.vision_encoder = self.clip.vision_model.encoder
-        self.vision_post_layernorm = self.clip.vision_model.post_layrnorm
+        self.vision_post_layernorm = self.clip.vision_model.post_layernorm
 
         self.metanet = MetaNet(self.vision_dim, self.text_dim)
 
@@ -67,33 +69,22 @@ class ConditionalPromptLearner(nn.Module):
             nn.Sigmoid(),
         )
 
-        logit_scale_init = 1 / 0.07  # CLIP 使用的初始 logit scale
-        self.logit_scale = nn.Parameter(torch.ones([]) * logit_scale_init)
+        self.logit_scale = nn.Parameter(self.clip.logit_scale.clone())
 
-        # 初始化类别嵌入
-        self.class_embeds = self._init_class_embeds(self.classnames)
+        # 保存投影层的引用（forward 中需要用到）
+        self.text_projection = self.clip.text_projection
+        self.visual_projection = self.clip.visual_projection
 
-        self.register_buffer(
-            "bos_embed",
-            self.token_embedding.weight[self.tokenizer.bos_token_id]
-            .clone()
-            .to(self.ctx.device),
-            persistent=False,
-        )  # (text_dim,)
-        self.register_buffer(
-            "eos_embed",
-            self.token_embedding.weight[self.tokenizer.eos_token_id]
-            .clone()
-            .to(self.ctx.device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "class_embeds", self.class_embeds.to(self.ctx.device), persistent=False
-        )
+        # 只注册 class_embeds 为 buffer（不持久化保存），bos 和 eos 在 construct_prompt 中即时获取
+        class_embeds_init = self._init_class_embeds(classnames).clone().detach()
+        self.register_buffer("class_embeds", class_embeds_init, persistent=False)
 
         self._init_prompt()
         self._init_weights()
         self._setup_modules_state()
+
+        # 删除完整的 clip 模型引用，避免保存时的内存共享问题
+        del self.clip
 
     def _init_prompt(self):
         text = "a photo of a"
@@ -130,7 +121,7 @@ class ConditionalPromptLearner(nn.Module):
 
     def _init_weights(self):
         if self.gate:
-            nn.init.constant_(self.gate[-2].bias, 10.0)
+            nn.init.constant_(self.gate[-2].bias, 3.0)
 
         for m in self.metanet.modules():
             if isinstance(m, nn.Linear):
@@ -139,11 +130,19 @@ class ConditionalPromptLearner(nn.Module):
                     nn.init.constant_(m.bias, 0.0)
 
     def _setup_modules_state(self):
-        # 冻结CLIP的所有参数
-        for param in self.clip.parameters():
+        # 显式冻结 text 模块的所有参数
+        for param in self.token_embedding.parameters():
+            param.requires_grad = False
+        for param in self.position_embedding.parameters():
+            param.requires_grad = False
+        for param in self.text_encoder.parameters():
+            param.requires_grad = False
+        for param in self.final_layer_norm.parameters():
+            param.requires_grad = False
+        for param in self.text_projection.parameters():
             param.requires_grad = False
 
-        # 解冻vision模块
+        # 解冻 vision 模块
         for param in self.vision_embedding.parameters():
             param.requires_grad = True
         for param in self.vision_pre_layernorm.parameters():
@@ -151,6 +150,8 @@ class ConditionalPromptLearner(nn.Module):
         for param in self.vision_post_layernorm.parameters():
             param.requires_grad = True
         for param in self.vision_encoder.parameters():
+            param.requires_grad = True
+        for param in self.visual_projection.parameters():
             param.requires_grad = True
 
     def text_encoder_forward(self, prompt):
@@ -162,11 +163,14 @@ class ConditionalPromptLearner(nn.Module):
             prompt.shape[0] * prompt.shape[1], prompt.shape[2], -1
         )  # (B*n_class,n_ctx+16+2,text_dim)
 
-        # if prompt_viewed.size(1)<self.clip.text_model.config.max_position_embeddings:
-        #     pad_len=self.clip.text_model.config.max_position_embeddings-prompt_viewed.size(1)
-
         inputs_embeds = prompt_viewed
-        embeddings = self.embedding(inputs_embeds=inputs_embeds)
+        # 手动构造 embeddings，避免保存 self.embedding 导致的重复引用
+        position_ids = torch.arange(
+            inputs_embeds.size(1), dtype=torch.long, device=inputs_embeds.device
+        )
+        position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.size(0), -1)
+        position_embeddings = self.position_embedding(position_ids)
+        embeddings = inputs_embeds + position_embeddings
 
         attention_mask = torch.ones(
             inputs_embeds.size()[:-1], dtype=torch.long, device=inputs_embeds.device
@@ -259,7 +263,7 @@ class ConditionalPromptLearner(nn.Module):
         pooled_output_adapted = last_hidden_states_adapted[:, 0, :]  # (B,vision_dim)
         last_hidden_states_adapted = self.vision_post_layernorm(pooled_output_adapted)
 
-        gate_weights = self.gate(last_hidden_states_S)  # (B,1)
+        gate_weights = self.gate(last_hidden_states_adapted)  # (B,1)
         fused_vision_feats = (
             gate_weights * last_hidden_states_S
             + (1 - gate_weights) * last_hidden_states_adapted
@@ -269,6 +273,7 @@ class ConditionalPromptLearner(nn.Module):
             fused_vision_feats,
             last_hidden_states_S,
             last_hidden_states_T,
+            last_hidden_states_adapted,  # 返回 adapted_feats 用于计算 gate 统计量
         )  # (B,vision_dim)
 
     def construct_prompt(self, vision_feats):
@@ -284,24 +289,22 @@ class ConditionalPromptLearner(nn.Module):
             [ctx_pi, self.class_embeds.unsqueeze(0).expand(b, -1, -1, -1)], dim=2
         )  # (B,n_class,n_ctx+16,text_dim)
 
+        # 即时从 token_embedding 获取 bos 和 eos，避免内存共享问题
+        bos_embed = self.token_embedding.weight[self.tokenizer.bos_token_id]
+        eos_embed = self.token_embedding.weight[self.tokenizer.eos_token_id]
+
         bos = (
-            self.bos_embed.unsqueeze(0)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand(b, n_class, -1, -1)
+            bos_embed.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(b, n_class, -1, -1)
         )  # (B,n_class,1,text_dim)
         eos = (
-            self.eos_embed.unsqueeze(0)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand(b, n_class, -1, -1)
+            eos_embed.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(b, n_class, -1, -1)
         )  # (B,n_class,1,text_dim)
         prompt = torch.cat([bos, prompt, eos], dim=2)  # (B,n_class,n_ctx+16+2,text_dim)
         return prompt
 
     def forward(self, pixel_values_S, pixel_values_T, labels=None):
-        fused_vision_feats, source_feats, target_feats = self.vision_encoder_forward(
-            pixel_values_S, pixel_values_T
+        fused_vision_feats, source_feats, target_feats, adapted_feats = (
+            self.vision_encoder_forward(pixel_values_S, pixel_values_T)
         )
 
         # 计算分类 logits
@@ -311,10 +314,10 @@ class ConditionalPromptLearner(nn.Module):
         )  # (B,n_class,n_ctx+16+2,text_dim)
 
         text_feats_S = self.text_encoder_forward(prompt_S)  # (B*n_class,text_dim)
-        text_feats_S = self.clip.text_projection(text_feats_S)  # (B*n_class,text_dim)
+        text_feats_S = self.text_projection(text_feats_S)  # (B*n_class,text_dim)
         text_feats_S = text_feats_S.view(b, -1, self.text_dim)  # (B,n_class,text_dim)
 
-        image_feats_S = self.clip.visual_projection(fused_vision_feats)  # (B,text_dim)
+        image_feats_S = self.visual_projection(fused_vision_feats)  # (B,text_dim)
         image_feats_S = image_feats_S.unsqueeze(1)  # (B,1,text_dim)
 
         logits_task = F.normalize(image_feats_S, dim=-1) @ F.normalize(
@@ -333,10 +336,10 @@ class ConditionalPromptLearner(nn.Module):
             target_feats_reversed
         )  # (B,n_class,n_ctx+16+2,text_dim)
         text_feats_T = self.text_encoder_forward(prompt_T)  # (B*n_class,text_dim)
-        text_feats_T = self.clip.text_projection(text_feats_T)  # (B*n_class,text_dim)
+        text_feats_T = self.text_projection(text_feats_T)  # (B*n_class,text_dim)
         text_feats_T = text_feats_T.view(b, -1, self.text_dim)  # (B,n_class,text_dim)
 
-        image_feats_T = self.clip.visual_projection(target_feats)  # (B,text_dim)
+        image_feats_T = self.visual_projection(target_feats)  # (B,text_dim)
         image_feats_T = image_feats_T.unsqueeze(1)  # (B,1,text_dim)
 
         logits_align = F.normalize(image_feats_T, dim=-1) @ F.normalize(
@@ -358,13 +361,14 @@ class ConditionalPromptLearner(nn.Module):
             loss_total = loss_task + loss_align
 
             with torch.no_grad():
-                gate_vals = self.gate(source_feats)
+                # 修改：使用 adapted_feats 计算 gate 统计量，与实际使用的输入一致
+                gate_vals = self.gate(adapted_feats)
                 gate_mean = gate_vals.mean().item()
                 gate_std = gate_vals.std().item()
 
             return GSPAOutput(
                 loss=loss_total,
-                logits=logits_task,
+                logits=None,
                 loss_task=loss_task.detach(),
                 loss_align=loss_align.detach(),
                 gate_mean=gate_mean,
