@@ -34,7 +34,9 @@ class OfficeHomeSource(Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(
+        pixel_values = self.image_processor(
+            image, return_tensors="pt"
+        ).pixel_values.squeeze(
             0
         )  # (,3,224,224)
 
@@ -84,9 +86,9 @@ class OfficeHomeTarget(Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(
-            0
-        )
+        pixel_values = self.image_processor(
+            image, return_tensors="pt"
+        ).pixel_values.squeeze(0)
 
         return {"pixel_values": pixel_values}
 
@@ -114,9 +116,9 @@ class OfficeHomeEval(Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(
-            0
-        )
+        pixel_values = self.image_processor(
+            image, return_tensors="pt"
+        ).pixel_values.squeeze(0)
 
         return {
             "pixel_values": pixel_values,
@@ -161,6 +163,44 @@ class DataCollatorTrain:
         }
 
 
+class MultiDomainEvalDataset(Dataset):
+    """多目标域评估数据集（拼接多个 OfficeHomeEval）"""
+
+    def __init__(self, source_domain, model_name):
+        """
+        Args:
+            source_domain: 源域名称，用于排除
+            model_name: 模型名称
+        """
+        full_dataset = load_dataset("flwrlabs/office-home", split="train")
+        all_domains = full_dataset.unique("domain")
+        self.target_domains = [d for d in all_domains if d != source_domain]
+
+        # 为每个目标域创建 OfficeHomeEval
+        self.domain_datasets = [
+            OfficeHomeEval(domain, model_name) for domain in self.target_domains
+        ]
+
+        # 计算累积长度，用于索引映射
+        self.cumulative_sizes = [0]
+        for ds in self.domain_datasets:
+            self.cumulative_sizes.append(self.cumulative_sizes[-1] + len(ds))
+
+    def __len__(self):
+        return self.cumulative_sizes[-1]
+
+    def __getitem__(self, idx):
+        # 找到对应的域和域内索引
+        for i, (start, end) in enumerate(
+            zip(self.cumulative_sizes[:-1], self.cumulative_sizes[1:])
+        ):
+            if start <= idx < end:
+                domain_idx = i
+                local_idx = idx - start
+                return self.domain_datasets[domain_idx][local_idx]
+        raise IndexError(f"Index {idx} out of range")
+
+
 class DataCollatorEval:
     """评估用 Collator"""
 
@@ -169,4 +209,12 @@ class DataCollatorEval:
         labels = torch.stack([f["label"] for f in features])
         domains = [f["domain"] for f in features]
 
-        return {"pixel_values": pixel_values, "labels": labels, "domains": domains}
+        # 将域名映射为整数（用于后续分组）
+        domain_to_id = {"Art": 0, "Clipart": 1, "Product": 2, "Real World": 3}
+        domain_ids = torch.tensor([domain_to_id[d] for d in domains], dtype=torch.long)
+
+        return {
+            "pixel_values": pixel_values,
+            "labels": labels,
+            "domain_ids": domain_ids,
+        }

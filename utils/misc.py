@@ -44,32 +44,59 @@ class GSPATrainer(Trainer):
     def evaluation_loop(
         self,
         dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
         metric_key_prefix="eval",
     ):
+        """重写评估循环，支持多域 MTDA 评估"""
         model = self._wrap_model(self.model, training=False, dataloader=dataloader)
         model.eval()
 
         all_preds = []
         all_labels = []
+        all_domain_ids = []
 
         for inputs in dataloader:
             inputs = self._prepare_inputs(inputs)
 
             with torch.no_grad():
-                # 测试时只传图像，不传目标域
-                outputs = model(inputs["pixel_values"], inputs["pixel_values"])
+                # 评估模式：只传 pixel_values（使用 infer 方法）
+                outputs = model(pixel_values=inputs["pixel_values"])
                 logits = outputs.logits
 
             preds = logits.argmax(dim=-1)
             all_preds.append(preds.cpu())
             all_labels.append(inputs["labels"].cpu())
+            all_domain_ids.append(inputs["domain_ids"].cpu())
 
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
+        all_domain_ids = torch.cat(all_domain_ids)
 
-        accuracy = (all_preds == all_labels).float().mean().item()
+        # 按域计算 accuracy
+        domain_names = ["Art", "Clipart", "Product", "Real World"]
+        metrics = {}
+        all_correct = 0
+        all_total = 0
 
-        metrics = {f"{metric_key_prefix}_accuracy": accuracy}
+        for domain_id, domain_name in enumerate(domain_names):
+            mask = all_domain_ids == domain_id
+            if mask.sum() == 0:
+                continue
+            domain_preds = all_preds[mask]
+            domain_labels = all_labels[mask]
+            correct = (domain_preds == domain_labels).sum().item()
+            total = len(domain_labels)
+            acc = correct / total
+            metrics[f"{metric_key_prefix}_acc_{domain_name}"] = acc
+            all_correct += correct
+            all_total += total
+
+        # 计算平均 accuracy
+        metrics[f"{metric_key_prefix}_acc_mean"] = (
+            all_correct / all_total if all_total > 0 else 0.0
+        )
 
         return type(
             "EvalLoopOutput",

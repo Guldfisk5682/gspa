@@ -276,6 +276,40 @@ class ConditionalPromptLearner(nn.Module):
             last_hidden_states_adapted,  # 返回 adapted_feats 用于计算 gate 统计量
         )  # (B,vision_dim)
 
+    def infer(self, pixel_values):
+        """
+        单图推理接口，用于评估（只走源域路径，不需要目标域）
+        """
+        # 完整通过视觉编码器
+        hidden_states = self.vision_embedding(pixel_values)
+        hidden_states = self.vision_pre_layernorm(hidden_states)
+        for blk in self.vision_encoder.layers:
+            hidden_states = blk(
+                hidden_states, attention_mask=None, causal_attention_mask=None
+            )[0]
+        pooled = hidden_states[:, 0, :]  # (B, vision_dim)
+        vision_feats = self.vision_post_layernorm(pooled)
+
+        # 构造 prompt 并计算分类 logits
+        b = vision_feats.shape[0]
+        prompt = self.construct_prompt(vision_feats)  # (B,n_class,n_ctx+16+2,text_dim)
+        text_feats = self.text_encoder_forward(prompt)  # (B*n_class,text_dim)
+        text_feats = self.text_projection(text_feats)  # (B*n_class,text_dim)
+        text_feats = text_feats.view(b, -1, self.text_dim)  # (B,n_class,text_dim)
+
+        img_feats = self.visual_projection(vision_feats)  # (B,text_dim)
+        img_feats = img_feats.unsqueeze(1)  # (B,1,text_dim)
+
+        logits = F.normalize(img_feats, dim=-1) @ F.normalize(
+            text_feats, dim=-1
+        ).permute(
+            0, 2, 1
+        )  # (B,1,n_class)
+        logits = self.logit_scale.exp() * logits  # scaled logits
+        logits = logits.squeeze(1)  # (B,n_class)
+
+        return logits
+
     def construct_prompt(self, vision_feats):
         b = vision_feats.shape[0]
         n_class = self.class_embeds.shape[0]
@@ -302,7 +336,20 @@ class ConditionalPromptLearner(nn.Module):
         prompt = torch.cat([bos, prompt, eos], dim=2)  # (B,n_class,n_ctx+16+2,text_dim)
         return prompt
 
-    def forward(self, pixel_values_S, pixel_values_T, labels=None):
+    def forward(
+        self,
+        pixel_values_S=None,
+        pixel_values_T=None,
+        pixel_values=None,
+        labels=None,
+        domain_ids=None,
+    ):
+        # 评估模式：只传 pixel_values（用于推理）
+        if pixel_values is not None:
+            logits = self.infer(pixel_values)
+            return GSPAOutput(logits=logits)
+
+        # 训练模式：传 pixel_values_S 和 pixel_values_T
         fused_vision_feats, source_feats, target_feats, adapted_feats = (
             self.vision_encoder_forward(pixel_values_S, pixel_values_T)
         )
