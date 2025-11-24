@@ -3,14 +3,18 @@ from datasets import load_dataset
 from torch.utils.data import Dataset
 import random
 import torch
+from torchvision import transforms
+
 
 
 class OfficeHomeSource(Dataset):
-    """
-    源域数据（有标签）
+    """源域数据（有标签）
+
+    可选轻度数据增强：RandAugment + GaussianBlur
+    仅在训练阶段启用，避免影响评估一致性。
     """
 
-    def __init__(self, domain, model_name):
+    def __init__(self, domain, model_name, augment=False):
         self.domain = domain
         self.image_processor = AutoImageProcessor.from_pretrained(model_name)
 
@@ -19,6 +23,17 @@ class OfficeHomeSource(Dataset):
         )
 
         self.classes = self.dataset.features["label"].names
+        self.augment = augment and transforms is not None
+        if self.augment:
+            # 轻度增强：控制 RandAugment 强度与操作数量，避免过度扭曲语义
+            self.augment_transforms = transforms.Compose(
+                [
+                    transforms.RandAugment(num_ops=2, magnitude=5),
+                    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+                ]
+            )
+        else:
+            self.augment_transforms = None
 
     def __len__(self):
         return len(self.dataset)
@@ -33,6 +48,11 @@ class OfficeHomeSource(Dataset):
 
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        # 仅对源域训练数据应用增强
+        if self.augment_transforms is not None:
+            # RandAugment / GaussianBlur 支持 PIL 图像；保持为 PIL 交给 image_processor
+            image = self.augment_transforms(image)
 
         pixel_values = self.image_processor(
             image, return_tensors="pt"
@@ -213,6 +233,39 @@ class DataCollatorEval:
         domain_to_id = {"Art": 0, "Clipart": 1, "Product": 2, "Real World": 3}
         domain_ids = torch.tensor([domain_to_id[d] for d in domains], dtype=torch.long)
 
+        return {
+            "pixel_values": pixel_values,
+            "labels": labels,
+            "domain_ids": domain_ids,
+        }
+
+
+class DataCollatorGSPA:
+    """统一的训练/评估 Collator。
+
+    根据样本字典的键自动分支：
+    - 训练样本: 包含 pixel_values_S / pixel_values_T / labels
+    - 评估样本: 包含 pixel_values / label / domain
+    """
+
+    def __call__(self, features):
+        # 训练分支
+        if "pixel_values_S" in features[0]:
+            pixel_values_S = torch.stack([f["pixel_values_S"] for f in features])
+            pixel_values_T = torch.stack([f["pixel_values_T"] for f in features])
+            labels = torch.stack([f["labels"] for f in features])
+            return {
+                "pixel_values_S": pixel_values_S,
+                "pixel_values_T": pixel_values_T,
+                "labels": labels,
+            }
+
+        # 评估分支
+        pixel_values = torch.stack([f["pixel_values"] for f in features])
+        labels = torch.stack([f["label"] for f in features])
+        domains = [f["domain"] for f in features]
+        domain_to_id = {"Art": 0, "Clipart": 1, "Product": 2, "Real World": 3}
+        domain_ids = torch.tensor([domain_to_id[d] for d in domains], dtype=torch.long)
         return {
             "pixel_values": pixel_values,
             "labels": labels,

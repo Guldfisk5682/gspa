@@ -376,9 +376,11 @@ class ConditionalPromptLearner(nn.Module):
         logits_task = logits_task.squeeze(1)  # (B,n_class)
 
         # 计算对齐logits
+        # 统一反转 target_feats，确保 ViT 和 MetaNet 都受 GRL 影响
         target_feats_reversed = grad_reverse(
             target_feats, 1.0
-        )  # 反转梯度，vit要最大化t熵，metanet要最小化t熵
+        )  # 反转梯度：ViT 最大化熵（不确定），MetaNet 最小化熵（判别性）
+
         prompt_T = self.construct_prompt(
             target_feats_reversed
         )  # (B,n_class,n_ctx+16+2,text_dim)
@@ -386,7 +388,9 @@ class ConditionalPromptLearner(nn.Module):
         text_feats_T = self.text_projection(text_feats_T)  # (B*n_class,text_dim)
         text_feats_T = text_feats_T.view(b, -1, self.text_dim)  # (B,n_class,text_dim)
 
-        image_feats_T = self.visual_projection(target_feats)  # (B,text_dim)
+        image_feats_T = self.visual_projection(
+            target_feats_reversed
+        )  # (B,text_dim) 修复：使用反转后的特征
         image_feats_T = image_feats_T.unsqueeze(1)  # (B,1,text_dim)
 
         logits_align = F.normalize(image_feats_T, dim=-1) @ F.normalize(
@@ -403,9 +407,13 @@ class ConditionalPromptLearner(nn.Module):
         )  # 目标域预测分布的熵作为对齐损失
 
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(label_smoothing=0.1)
             loss_task = loss_fct(logits_task, labels)
-            loss_total = loss_task + loss_align
+
+            # 渐进式对齐损失权重（从训练参数中获取，如果没有则默认为 1.0）
+            align_weight = getattr(self, "_align_weight", 1.0)
+            loss_align_weighted = align_weight * loss_align  # 加权后的对齐损失
+            loss_total = loss_task + loss_align_weighted
 
             with torch.no_grad():
                 # 修改：使用 adapted_feats 计算 gate 统计量，与实际使用的输入一致
@@ -417,7 +425,7 @@ class ConditionalPromptLearner(nn.Module):
                 loss=loss_total,
                 logits=None,
                 loss_task=loss_task.detach(),
-                loss_align=loss_align.detach(),
+                loss_align=loss_align_weighted.detach(),  # 返回加权后的损失
                 gate_mean=gate_mean,
                 gate_std=gate_std,
             )

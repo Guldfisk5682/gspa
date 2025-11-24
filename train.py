@@ -4,9 +4,8 @@ from data.office_home import (
     OfficeHomeSource,
     OfficeHomeTarget,
     PairedDataset,
-    DataCollatorTrain,
     MultiDomainEvalDataset,
-    DataCollatorEval,
+    DataCollatorGSPA,
 )
 from model.gspa import ConditionalPromptLearner
 from model.config import GSPAConfig
@@ -29,7 +28,8 @@ def main():
     log_dir = os.path.join(output_dir, "logs")
 
     # 训练数据集
-    train_source = OfficeHomeSource(source_domain, model_name)
+    # 源域数据启用轻度增强
+    train_source = OfficeHomeSource(source_domain, model_name, augment=True)
     train_target = OfficeHomeTarget(source_domain, model_name)
     train_dataset = PairedDataset(train_source, train_target)
     print("PairedDataset created successfully")
@@ -50,9 +50,9 @@ def main():
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=log_dir,
-        num_train_epochs=10,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=16,
+        num_train_epochs=25,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=64,
         gradient_accumulation_steps=4,
         learning_rate=2e-5,
         max_grad_norm=1.0,
@@ -62,7 +62,7 @@ def main():
         save_total_limit=2,
         load_best_model_at_end=True,  # 训练结束时加载最佳模型
         metric_for_best_model="eval_acc_mean",  # 使用平均 accuracy 选择最佳模型
-        greater_is_better=True,  # accuracy 越高越好
+        greater_is_better=True,
         bf16=True,
         dataloader_num_workers=8,
         remove_unused_columns=False,
@@ -72,14 +72,51 @@ def main():
         weight_decay=0.01,
     )
 
-    # Trainer
+    # 设置分组学习率：gate 使用更小的学习率
+    # 学习率分组：gate 最小，metanet 提升 10x，其他保持基准
+    base_lr = 2e-5
+    meta_lr_scale = 10.0  # 可调倍率
+
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if "gate" in n and p.requires_grad
+            ],
+            "lr": 2e-6,  # gate 的学习率
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if "metanet" in n and p.requires_grad
+            ],
+            "lr": base_lr * meta_lr_scale,  # metanet 提升 10x
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if "gate" not in n and "metanet" not in n and p.requires_grad
+            ],
+            "lr": base_lr,  # 其他参数
+        },
+    ]
+
+    # Trainer（添加 lambda_max 参数用于渐进式对齐损失）
     trainer = GSPATrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,  # 添加评估数据集
-        data_collator=DataCollatorTrain(),
-        eval_data_collator=DataCollatorEval(),  # 评估数据的 collator
+        eval_dataset=eval_dataset,  # 多目标域评估数据集
+        data_collator=DataCollatorGSPA(),  # 统一 Collator
+        optimizers=(
+            torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01),
+            None,
+        ),
+        lambda_max=0.5,  # 对齐损失的最大权重，从 0 渐进到 0.5
+        align_warmup_epochs=25,  # 前2个 epoch λ=0，稳定 gate
     )
 
     # 训练
