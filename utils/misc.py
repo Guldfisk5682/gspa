@@ -26,27 +26,26 @@ class GSPATrainer(Trainer):
         loss = outputs.loss
 
         if self.state.global_step % self.args.logging_steps == 0:
+            def _reduce(val):
+                if val is None:
+                    return 0.0
+                if isinstance(val, torch.Tensor):
+                    # If gathered from DataParallel, may have shape [n_devices]
+                    if val.numel() == 1:
+                        return val.item()
+                    else:
+                        return val.mean().item()
+                # Fallback for python floats
+                try:
+                    return float(val)
+                except Exception:
+                    return 0.0
+
             logs = {
-                "loss_task": (
-                    outputs.loss_task.item()
-                    if getattr(outputs, "loss_task", None) is not None
-                    else 0.0
-                ),
-                "loss_align": (
-                    outputs.loss_align.item()
-                    if getattr(outputs, "loss_align", None) is not None
-                    else 0.0
-                ),
-                "gate_mean": (
-                    outputs.gate_mean
-                    if getattr(outputs, "gate_mean", None) is not None
-                    else 0.0
-                ),
-                "gate_std": (
-                    outputs.gate_std
-                    if getattr(outputs, "gate_std", None) is not None
-                    else 0.0
-                ),
+                "loss_task": _reduce(getattr(outputs, "loss_task", None)),
+                "loss_align": _reduce(getattr(outputs, "loss_align", None)),
+                "gate_mean": _reduce(getattr(outputs, "gate_mean", None)),
+                "gate_std": _reduce(getattr(outputs, "gate_std", None)),
             }
             self.log(logs)
 

@@ -14,6 +14,7 @@ import torch
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 base_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,9 +52,9 @@ def main():
         output_dir=output_dir,
         logging_dir=log_dir,
         num_train_epochs=25,
-        per_device_train_batch_size=16,
+        per_device_train_batch_size=8,
         per_device_eval_batch_size=64,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=8,
         learning_rate=2e-5,
         max_grad_norm=1.0,
         logging_steps=50,

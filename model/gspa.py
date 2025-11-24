@@ -55,7 +55,7 @@ class ConditionalPromptLearner(nn.Module):
 
         # ---Vision Model拆分---
         self.vision_embedding = self.clip.vision_model.embeddings
-        self.vision_pre_layernorm = self.clip.vision_model.pre_layernorm
+        self.vision_pre_layernorm = self.clip.vision_model.pre_layrnorm
         self.vision_encoder = self.clip.vision_model.encoder
         self.vision_post_layernorm = self.clip.vision_model.post_layernorm
 
@@ -413,8 +413,9 @@ class ConditionalPromptLearner(nn.Module):
 
             with torch.no_grad():
                 gate_vals = self.gate(last_hidden_S_adapted)
-                gate_mean = gate_vals.mean().item()
-                gate_std = gate_vals.std().item()
+                # Keep as 0-d tensors (no .item()) so DataParallel can gather
+                gate_mean = gate_vals.mean().detach()
+                gate_std = gate_vals.std().detach()
 
             return GSPAOutput(
                 loss=loss_total,
