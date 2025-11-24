@@ -7,7 +7,6 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.modeling_outputs import BaseModelOutput
 from torch.nn import functional as F
-from .modules.grl import grad_reverse
 from .modules.output import GSPAOutput
 
 # 加载 CLIP
@@ -56,7 +55,7 @@ class ConditionalPromptLearner(nn.Module):
 
         # ---Vision Model拆分---
         self.vision_embedding = self.clip.vision_model.embeddings
-        self.vision_pre_layernorm = self.clip.vision_model.pre_layrnorm
+        self.vision_pre_layernorm = self.clip.vision_model.pre_layernorm
         self.vision_encoder = self.clip.vision_model.encoder
         self.vision_post_layernorm = self.clip.vision_model.post_layernorm
 
@@ -201,80 +200,91 @@ class ConditionalPromptLearner(nn.Module):
 
     def vision_encoder_forward(self, pixel_value_S, pixel_value_T):
         """
-        分别接受源域和目标域图像
+        分别接受源域和目标域图像，执行对称的交叉风格注入
         """
-        # 源域处理
-        # 1. 获得浅层风格特征并归一化
+        # === 1. 浅层特征提取 (0-3层) ===
+
+        # --- Source (提取内容 & 风格) ---
         hidden_states_S = self.vision_embedding(pixel_value_S)
         hidden_states_S = self.vision_pre_layernorm(hidden_states_S)
-        hidden_states_S_temp = hidden_states_S
         for i in self.vision_encoder.layers[:4]:
-            hidden_states_S_temp = i(
-                hidden_states_S_temp, attention_mask=None, causal_attention_mask=None
+            hidden_states_S = i(
+                hidden_states_S, attention_mask=None, causal_attention_mask=None
             )[0]
 
-        style_states_S = hidden_states_S_temp
+        style_states_S = hidden_states_S
         style_mean_S = style_states_S.mean(dim=1, keepdim=True)
         style_std_S = style_states_S.std(dim=1, keepdim=True) + 1e-6
         style_normed_S = (style_states_S - style_mean_S) / style_std_S
 
-        # 2. 完整通过视觉编码器
-        for i in self.vision_encoder.layers[4:]:
-            hidden_states_S = i(
-                hidden_states_S, attention_mask=None, causal_attention_mask=None
-            )[0]
-        pooled_output_S = hidden_states_S[:, 0, :]  # (B,vision_dim)
-        last_hidden_states_S = self.vision_post_layernorm(pooled_output_S)
-
-        # 目标域处理
-        # 1. 获得浅层风格特征
+        # --- Target (提取内容 & 风格) ---
         hidden_states_T = self.vision_embedding(pixel_value_T)
         hidden_states_T = self.vision_pre_layernorm(hidden_states_T)
-        hidden_states_T_temp = hidden_states_T
         for i in self.vision_encoder.layers[:4]:
-            hidden_states_T_temp = i(
-                hidden_states_T_temp, attention_mask=None, causal_attention_mask=None
-            )[0]
-
-        style_states_T = hidden_states_T_temp
-        style_mean_T = style_states_T.mean(dim=1, keepdim=True)
-        style_std_T = style_states_T.std(dim=1, keepdim=True) + 1e-6
-
-        # 2. 完整通过视觉编码器
-        for i in self.vision_encoder.layers[4:]:
             hidden_states_T = i(
                 hidden_states_T, attention_mask=None, causal_attention_mask=None
             )[0]
-        pooled_output_T = hidden_states_T[:, 0, :]  # (B,vision_dim)
-        last_hidden_states_T = self.vision_post_layernorm(pooled_output_T)
 
-        # 风格自适应
-        hidden_states_adapted = style_normed_S * style_std_T + style_mean_T
+        style_states_T = hidden_states_T
+        style_mean_T = style_states_T.mean(dim=1, keepdim=True)
+        style_std_T = style_states_T.std(dim=1, keepdim=True) + 1e-6
+        style_normed_T = (style_states_T - style_mean_T) / style_std_T
 
-        hidden_states_adapted_temp = hidden_states_adapted
+        # === 2. 原始路径 (Original Path) - 用于 Gate 输入 ===
+
+        # Source Original Deep
+        feat_S_orig = hidden_states_S
         for i in self.vision_encoder.layers[4:]:
-            hidden_states_adapted_temp = i(
-                hidden_states_adapted_temp,
-                attention_mask=None,
-                causal_attention_mask=None,
+            feat_S_orig = i(
+                feat_S_orig, attention_mask=None, causal_attention_mask=None
             )[0]
-        last_hidden_states_adapted = hidden_states_adapted_temp
+        last_hidden_S = self.vision_post_layernorm(feat_S_orig[:, 0, :])
 
-        pooled_output_adapted = last_hidden_states_adapted[:, 0, :]  # (B,vision_dim)
-        last_hidden_states_adapted = self.vision_post_layernorm(pooled_output_adapted)
+        # Target Original Deep (新增，为了对称)
+        feat_T_orig = hidden_states_T
+        for i in self.vision_encoder.layers[4:]:
+            feat_T_orig = i(
+                feat_T_orig, attention_mask=None, causal_attention_mask=None
+            )[0]
+        last_hidden_T = self.vision_post_layernorm(feat_T_orig[:, 0, :])
 
-        gate_weights = self.gate(last_hidden_states_adapted)  # (B,1)
-        fused_vision_feats = (
-            gate_weights * last_hidden_states_S
-            + (1 - gate_weights) * last_hidden_states_adapted
-        )
+        # === 3. 交叉风格适配 (Symmetric Cross-Adaptation) ===
+
+        # S_adapted = S内容 + T风格 (为了鲁棒性，模拟目标域)
+        hidden_S_adapted = style_normed_S * style_std_T + style_mean_T
+
+        # T_adapted = T内容 + S风格 (为了对齐，模拟源域) <-- 你的核心修改
+        hidden_T_adapted = style_normed_T * style_std_S + style_mean_S
+
+        # 跑完深层
+        for i in self.vision_encoder.layers[4:]:
+            hidden_S_adapted = i(
+                hidden_S_adapted, attention_mask=None, causal_attention_mask=None
+            )[0]
+            hidden_T_adapted = i(
+                hidden_T_adapted, attention_mask=None, causal_attention_mask=None
+            )[0]
+
+        last_hidden_S_adapted = self.vision_post_layernorm(hidden_S_adapted[:, 0, :])
+        last_hidden_T_adapted = self.vision_post_layernorm(hidden_T_adapted[:, 0, :])
+
+        # === 4. 门控融合 (Gating) ===
+        # 两边都使用 Gate 进行融合，保持结构一致性
+
+        # Source Fusion
+        gate_S = self.gate(last_hidden_S_adapted)  # 使用 adapted 特征判断融合比例
+        fused_S = gate_S * last_hidden_S + (1 - gate_S) * last_hidden_S_adapted
+
+        # Target Fusion (现在 T 也走这一套流程)
+        gate_T = self.gate(last_hidden_T_adapted)
+        fused_T = gate_T * last_hidden_T + (1 - gate_T) * last_hidden_T_adapted
 
         return (
-            fused_vision_feats,
-            last_hidden_states_S,
-            last_hidden_states_T,
-            last_hidden_states_adapted,  # 返回 adapted_feats 用于计算 gate 统计量
-        )  # (B,vision_dim)
+            fused_S,
+            fused_T,  # 注意：这里返回的是融合后的 T
+            last_hidden_S,  # 原始 S (备用)
+            last_hidden_S_adapted,  # 用于外层计算 Gate 统计量 logging
+        )
 
     def infer(self, pixel_values):
         """
@@ -350,21 +360,20 @@ class ConditionalPromptLearner(nn.Module):
             return GSPAOutput(logits=logits)
 
         # 训练模式：传 pixel_values_S 和 pixel_values_T
-        fused_vision_feats, source_feats, target_feats, adapted_feats = (
+        # 经过对称风格适配与门控融合：返回 (fused_S, fused_T, last_hidden_S, last_hidden_S_adapted)
+        fused_S, fused_T, last_hidden_S, last_hidden_S_adapted = (
             self.vision_encoder_forward(pixel_values_S, pixel_values_T)
         )
 
         # 计算分类 logits
-        b = fused_vision_feats.shape[0]
-        prompt_S = self.construct_prompt(
-            fused_vision_feats
-        )  # (B,n_class,n_ctx+16+2,text_dim)
+        b = fused_S.shape[0]
+        prompt_S = self.construct_prompt(fused_S)  # (B,n_class,n_ctx+16+2,text_dim)
 
         text_feats_S = self.text_encoder_forward(prompt_S)  # (B*n_class,text_dim)
         text_feats_S = self.text_projection(text_feats_S)  # (B*n_class,text_dim)
         text_feats_S = text_feats_S.view(b, -1, self.text_dim)  # (B,n_class,text_dim)
 
-        image_feats_S = self.visual_projection(fused_vision_feats)  # (B,text_dim)
+        image_feats_S = self.visual_projection(fused_S)  # (B,text_dim)
         image_feats_S = image_feats_S.unsqueeze(1)  # (B,1,text_dim)
 
         logits_task = F.normalize(image_feats_S, dim=-1) @ F.normalize(
@@ -375,22 +384,13 @@ class ConditionalPromptLearner(nn.Module):
         logits_task = self.logit_scale.exp() * logits_task  # scaled logits
         logits_task = logits_task.squeeze(1)  # (B,n_class)
 
-        # 计算对齐logits
-        # 统一反转 target_feats，确保 ViT 和 MetaNet 都受 GRL 影响
-        target_feats_reversed = grad_reverse(
-            target_feats, 1.0
-        )  # 反转梯度：ViT 最大化熵（不确定），MetaNet 最小化熵（判别性）
-
-        prompt_T = self.construct_prompt(
-            target_feats_reversed
-        )  # (B,n_class,n_ctx+16+2,text_dim)
+        # 计算目标域融合特征的分类 logits 以衡量其不确定性（熵）
+        prompt_T = self.construct_prompt(fused_T)  # (B,n_class,n_ctx+16+2,text_dim)
         text_feats_T = self.text_encoder_forward(prompt_T)  # (B*n_class,text_dim)
         text_feats_T = self.text_projection(text_feats_T)  # (B*n_class,text_dim)
         text_feats_T = text_feats_T.view(b, -1, self.text_dim)  # (B,n_class,text_dim)
 
-        image_feats_T = self.visual_projection(
-            target_feats_reversed
-        )  # (B,text_dim) 修复：使用反转后的特征
+        image_feats_T = self.visual_projection(fused_T)  # (B,text_dim)
         image_feats_T = image_feats_T.unsqueeze(1)  # (B,1,text_dim)
 
         logits_align = F.normalize(image_feats_T, dim=-1) @ F.normalize(
@@ -398,26 +398,21 @@ class ConditionalPromptLearner(nn.Module):
         ).permute(
             0, 2, 1
         )  # (B,1,n_class)
-        logits_align = self.logit_scale.exp() * logits_align  # scaled logits
+        logits_align = self.logit_scale.exp() * logits_align
         logits_align = logits_align.squeeze(1)  # (B,n_class)
 
-        probs_a = F.softmax(logits_align, dim=-1)  # (B,n_class)
-        loss_align = (
-            -(probs_a * torch.log(probs_a + 1e-6)).sum(dim=-1).mean()
-        )  # 目标域预测分布的熵作为对齐损失
+        probs_align = F.softmax(logits_align, dim=-1)
+        loss_align = -(probs_align * torch.log(probs_align + 1e-6)).sum(dim=-1).mean()
 
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss(label_smoothing=0.1)
             loss_task = loss_fct(logits_task, labels)
 
-            # 渐进式对齐损失权重（从训练参数中获取，如果没有则默认为 1.0）
-            align_weight = getattr(self, "_align_weight", 1.0)
-            loss_align_weighted = align_weight * loss_align  # 加权后的对齐损失
-            loss_total = loss_task + loss_align_weighted
+            # 熵对齐采用固定较小权重避免破坏判别特征
+            loss_total = loss_task + 0.1 * loss_align
 
             with torch.no_grad():
-                # 修改：使用 adapted_feats 计算 gate 统计量，与实际使用的输入一致
-                gate_vals = self.gate(adapted_feats)
+                gate_vals = self.gate(last_hidden_S_adapted)
                 gate_mean = gate_vals.mean().item()
                 gate_std = gate_vals.std().item()
 
@@ -425,7 +420,7 @@ class ConditionalPromptLearner(nn.Module):
                 loss=loss_total,
                 logits=None,
                 loss_task=loss_task.detach(),
-                loss_align=loss_align_weighted.detach(),  # 返回加权后的损失
+                loss_align=loss_align.detach(),  # 返回未缩放熵，方便监控
                 gate_mean=gate_mean,
                 gate_std=gate_std,
             )
@@ -436,12 +431,31 @@ class ConditionalPromptLearner(nn.Module):
             )
 
 
-# 测试
 if __name__ == "__main__":
+    # 极简自检：构造模型并跑一次训练/推理前向
+    from .config import GSPAConfig
+
     classnames = ["cat", "dog", "car", "bus"]
-    model = ConditionalPromptLearner(model_name, classnames, n_ctx=4)
-    processor = CLIPProcessor.from_pretrained(model_name)
-    dummy_image_S = torch.randn(1, 3, 224, 224)
-    dummy_image_T = torch.randn(1, 3, 224, 224)
-    logits = model(dummy_image_S, dummy_image_T)  # (1,n_class)
-    print(logits)
+    config = GSPAConfig(model_name_or_path=model_name, ctx=4, class_names=classnames)
+    model = ConditionalPromptLearner(config)
+    model.eval()
+
+    pixel_values_S = torch.randn(2, 3, 224, 224)
+    pixel_values_T = torch.randn(2, 3, 224, 224)
+    labels = torch.randint(0, len(classnames), (2,))
+
+    with torch.no_grad():
+        out_train = model(
+            pixel_values_S=pixel_values_S,
+            pixel_values_T=pixel_values_T,
+            labels=labels,
+        )
+        out_eval = model(pixel_values=pixel_values_S)
+
+    print(
+        "loss_total, loss_task, loss_align ->",
+        out_train.loss.item(),
+        out_train.loss_task.item(),
+        out_train.loss_align.item(),
+    )
+    print("eval logits shape ->", out_eval.logits.shape)

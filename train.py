@@ -104,19 +104,17 @@ def main():
         },
     ]
 
-    # Trainer（添加 lambda_max 参数用于渐进式对齐损失）
+    # Trainer（已移除对齐动态 λ，保持简洁）
     trainer = GSPATrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,  # 多目标域评估数据集
-        data_collator=DataCollatorGSPA(),  # 统一 Collator
+        eval_dataset=eval_dataset,
+        data_collator=DataCollatorGSPA(),
         optimizers=(
             torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01),
             None,
         ),
-        lambda_max=0.5,  # 对齐损失的最大权重，从 0 渐进到 0.5
-        align_warmup_epochs=25,  # 前2个 epoch λ=0，稳定 gate
     )
 
     # 训练
