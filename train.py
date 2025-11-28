@@ -51,15 +51,18 @@ def main():
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=log_dir,
-        num_train_epochs=25,
+        num_train_epochs=2,
         per_device_train_batch_size=8,
         per_device_eval_batch_size=64,
         gradient_accumulation_steps=8,
         learning_rate=2e-5,
         max_grad_norm=1.0,
         logging_steps=50,
-        eval_strategy="epoch",  # 每个 epoch 评估一次
-        save_strategy="epoch",
+        lr_scheduler_type="cosine",
+        eval_strategy="steps", 
+        save_strategy="steps",
+        eval_steps=7,
+        save_steps=7,
         save_total_limit=2,
         load_best_model_at_end=True,  # 训练结束时加载最佳模型
         metric_for_best_model="eval_acc_mean",  # 使用平均 accuracy 选择最佳模型
@@ -75,7 +78,7 @@ def main():
 
     # 设置分组学习率：gate 使用更小的学习率
     # 学习率分组：gate 最小，metanet 提升 10x，其他保持基准
-    base_lr = 2e-5
+    base_lr = 1e-5
     meta_lr_scale = 10.0  # 可调倍率
 
     optimizer_grouped_parameters = [
