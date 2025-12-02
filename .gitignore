@@ -2,4 +2,5 @@ data/*
 !data/office_home.py
 !data/__init__.py
 
-outputs/*
+outputs*/*
+**/__pycache__/

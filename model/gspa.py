@@ -69,6 +69,7 @@ class ConditionalPromptLearner(nn.Module):
         )
 
         self.logit_scale = nn.Parameter(self.clip.logit_scale.clone())
+        self.align_weight=0.1
 
         # 保存投影层的引用（forward 中需要用到）
         self.text_projection = self.clip.text_projection
@@ -409,7 +410,7 @@ class ConditionalPromptLearner(nn.Module):
             loss_task = loss_fct(logits_task, labels)
 
             # 熵对齐采用固定较小权重避免破坏判别特征
-            loss_total = loss_task + 0.1 * loss_align
+            loss_total = loss_task + self.align_weight * loss_align
 
             with torch.no_grad():
                 gate_vals = self.gate(last_hidden_S_adapted)

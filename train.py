@@ -9,7 +9,7 @@ from data.office_home import (
 )
 from model.gspa import ConditionalPromptLearner
 from model.config import GSPAConfig
-from utils.misc import set_seed, GSPATrainer
+from utils.misc import set_seed, GSPATrainer,EMACallBack
 import torch
 import os
 
@@ -24,8 +24,8 @@ def main():
 
     # 配置
     model_name = "openai/clip-vit-base-patch16"
-    source_domain = "Product"
-    output_dir = os.path.join(base_path, "outputs", "product_to_others")
+    source_domain = "Real World"
+    output_dir = os.path.join(base_path, "outputs", "real_world_to_others")
     log_dir = os.path.join(output_dir, "logs")
 
     # 训练数据集
@@ -51,18 +51,18 @@ def main():
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=log_dir,
-        num_train_epochs=2,
+        num_train_epochs=15,
         per_device_train_batch_size=8,
         per_device_eval_batch_size=64,
         gradient_accumulation_steps=8,
-        learning_rate=2e-5,
+        learning_rate=1e-5,
         max_grad_norm=1.0,
-        logging_steps=50,
+        logging_steps=25,
         lr_scheduler_type="cosine",
         eval_strategy="steps", 
         save_strategy="steps",
-        eval_steps=7,
-        save_steps=7,
+        eval_steps=35,
+        save_steps=35,
         save_total_limit=2,
         load_best_model_at_end=True,  # 训练结束时加载最佳模型
         metric_for_best_model="eval_acc_mean",  # 使用平均 accuracy 选择最佳模型
@@ -71,14 +71,16 @@ def main():
         dataloader_num_workers=8,
         remove_unused_columns=False,
         dataloader_pin_memory=True,
+        ddp_find_unused_parameters=False,
         report_to="tensorboard",
         optim="adamw_torch",
         weight_decay=0.01,
+        seed=42,
     )
 
     # 设置分组学习率：gate 使用更小的学习率
     # 学习率分组：gate 最小，metanet 提升 10x，其他保持基准
-    base_lr = 1e-5
+    base_lr = 1e-4
     meta_lr_scale = 10.0  # 可调倍率
 
     optimizer_grouped_parameters = [
@@ -88,7 +90,7 @@ def main():
                 for n, p in model.named_parameters()
                 if "gate" in n and p.requires_grad
             ],
-            "lr": 2e-6,  # gate 的学习率
+            "lr": base_lr * 0.1,  # gate 的学习率
         },
         {
             "params": [
@@ -119,6 +121,7 @@ def main():
             torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01),
             None,
         ),
+        callbacks=[EMACallBack(ema_decay=0.999)],
     )
 
     # 训练
